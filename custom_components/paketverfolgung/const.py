@@ -7,8 +7,6 @@ SEARCH_URL = "https://www.dhl.de/int-verfolgen/data/search"
 DHL_AUTH_BASE = "https://login.dhl.de/af5f9bb6-27ad-4af4-9445-008e7a5cddb8/login"
 DHL_CLIENT_ID = "83471082-5c13-4fce-8dcb-19d2a3fca413"
 DHL_REDIRECT_URI = "dhllogin://de.deutschepost.dhl/login"
-# DHL's mobile-app OAuth client currently expects this PKCE pair. Keep this in sync
-# with the login URL used by the official-app compatible browser flow.
 DHL_CODE_VERIFIER = "zmVs5AKfGvv45a9aUvuOid9a_erOirp7XL1sn9kWT_o"
 DHL_CODE_CHALLENGE = "MAhrhXXZP-Owy-R7ruyB7Fn-Z8ODW6qxCoHg4uXELCw"
 DHL_LOGIN_STATE = "eyJycyI6dHJ1ZSwicnYiOmZhbHNlLCJmaWQiOiJhcHAtbG9naW4tbWVoci1mb290ZXIiLCJoaWQiOiJhcHAtbG9naW4tbWVoci1oZWFkZXIiLCJycCI6ZmFsc2V9"
@@ -26,6 +24,12 @@ CONF_UPDATE_INTERVAL = "update_interval_minutes"
 CONF_DHL_SESSION = "dhl_session"
 CONF_AUTO_DISCOVERY = "auto_discovery"
 CONF_DHL_REDIRECT = "dhl_redirect"
+
+CONF_AMAZON_ENABLED = "amazon_enabled"
+CONF_AMAZON_COOKIES = "amazon_cookies"
+CONF_AMAZON_USERNAME = "amazon_username"
+CONF_AMAZON_PASSWORD = "amazon_password"
+CONF_AMAZON_OTP = "amazon_otp"
 
 SERVICE_ADD_TRACKING_NUMBER = "add_tracking_number"
 ATTR_TRACKING_NUMBER = "tracking_number"
@@ -53,3 +57,12 @@ PROGRESS_ICONS = {
 DEFAULT_STATUS = "Unbekannt"
 DEFAULT_ICON = "mdi:package-variant-closed"
 PROGRESS_OUT_FOR_DELIVERY = 4
+
+AMAZON_STATUS_ICONS = {
+    "ORDER_PLACED": "mdi:cart-check",
+    "SHIPPING_SOON": "mdi:package-variant",
+    "IN_TRANSIT": "mdi:truck-outline",
+    "OUT_FOR_DELIVERY": "mdi:truck-delivery",
+    "DELIVERED": "mdi:package-variant-closed-check",
+    "PICKED_UP": "mdi:package-variant-closed-check",
+}
