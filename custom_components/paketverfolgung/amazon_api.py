@@ -158,7 +158,6 @@ def _is_tracking_href(href: str) -> bool:
     )
     if any(marker in lowered for marker in markers):
         return True
-    # Amazon also uses generic your-orders endpoints whose query contains shipment IDs.
     return (
         "your-orders" in lowered
         and ("shipmentid=" in lowered or "packageid=" in lowered)
@@ -177,6 +176,30 @@ def _query_value(url: str, *keys: str) -> str:
         if value:
             return value[0]
     return ""
+
+
+def _normalize_carrier(raw: str, page_text: str) -> str:
+    """Return a short carrier name without tracking-page action text."""
+    candidates = [raw, page_text]
+    for text in candidates:
+        if not text:
+            continue
+        match = re.search(
+            r"Versendet mit\s+(.+?)(?=\s+Trackingnummer\b|\s+Alle Aktualisierungen\b|\s+Lieferanweisungen\b|\s+Versandadresse\b|\s+Bestellinfo\b|$)",
+            text,
+            flags=re.I,
+        )
+        if match:
+            return " ".join(match.group(1).split()).strip(" :-")
+
+    cleaned = " ".join((raw or "").split()).strip()
+    cleaned = re.split(
+        r"\s+(?:Trackingnummer|Alle Aktualisierungen|Lieferanweisungen|Versandadresse|Bestellinfo)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" :-")
+    return cleaned
 
 
 class AmazonApiClient:
@@ -280,9 +303,7 @@ class AmazonApiClient:
     async def submit_otp(
         self, challenge: AmazonOtpChallenge, code: str
     ) -> dict[str, str]:
-        self._jar.update_cookies(
-            challenge.cookies, response_url=URL(AMAZON_BASE)
-        )
+        self._jar.update_cookies(challenge.cookies, response_url=URL(AMAZON_BASE))
         form = dict(challenge.form)
         if challenge.mode == "mfa":
             form["otpCode"] = code
@@ -329,8 +350,6 @@ class AmazonApiClient:
             order_links: list[tuple[str, str]] = []
             seen_urls: set[str] = set()
 
-            # First prefer links attached to individual order cards so we can keep a
-            # useful product/order description where available.
             for order in order_cards:
                 desc_tag = (
                     order.select_one(".yohtmlc-product-title")
@@ -353,8 +372,6 @@ class AmazonApiClient:
                         seen_urls.add(absolute)
                         order_links.append((desc, absolute))
 
-            # Fallback: Amazon regularly changes the order-card markup. Scan the
-            # complete page so a changed wrapper class doesn't hide tracking links.
             for link in soup.select("a[href]"):
                 href = str(link.get("href") or "")
                 text = link.get_text(" ", strip=True).lower()
@@ -379,16 +396,20 @@ class AmazonApiClient:
                 )
 
             shipments: list[dict[str, Any]] = []
+            skipped_without_tracking = 0
             for desc, url in order_links:
                 shipment = await self._fetch_tracking_page(url, desc)
                 if shipment:
                     shipments.append(shipment)
+                else:
+                    skipped_without_tracking += 1
 
             _LOGGER.info(
-                "Amazon: order_cards=%d tracking_links=%d shipments=%d",
+                "Amazon: order_cards=%d tracking_links=%d shipments=%d skipped_without_tracking=%d",
                 len(order_cards),
                 len(order_links),
                 len(shipments),
+                skipped_without_tracking,
             )
             return shipments, self.export_cookies()
         except ClientError as err:
@@ -480,28 +501,21 @@ class AmazonApiClient:
             if match:
                 tracking_id = match.group(1)
 
-        order_id = _query_value(final_url, "orderId", "orderID", "order")
-        shipment_query_id = _query_value(
-            final_url, "shipmentId", "shipmentID", "packageId", "packageID"
-        )
-        shipment_id = tracking_id or shipment_query_id or order_id
-        if not shipment_id:
-            _LOGGER.warning("Amazon: tracking page found but no shipment identifier")
+        # Do not create entities from Amazon's internal shipment/package IDs. Those
+        # are order placeholders, not actual trackable parcels. We deliberately do
+        # not require a DE prefix because other carriers may use different formats.
+        if not tracking_id:
             return None
+
+        order_id = _query_value(final_url, "orderId", "orderID", "order")
+        shipment_id = tracking_id
 
         carrier_tag = (
             soup.select_one(".carrierRelatedInfo-mfn-providerTitle")
             or soup.select_one("[class*='providerTitle']")
         )
-        carrier = " ".join(carrier_tag.stripped_strings) if carrier_tag else ""
-        if not carrier:
-            carrier_match = re.search(
-                r"Versendet mit\s+([^|]+?)(?:\s+Versandadresse|\s+Bestellinfo|$)",
-                page_text,
-                flags=re.I,
-            )
-            if carrier_match:
-                carrier = carrier_match.group(1).strip()
+        carrier_raw = " ".join(carrier_tag.stripped_strings) if carrier_tag else ""
+        carrier = _normalize_carrier(carrier_raw, page_text)
 
         short_status = (
             (state.get("detailedState") or {}).get("shortStatus")
@@ -510,8 +524,6 @@ class AmazonApiClient:
         )
 
         if not status:
-            # Last-resort fallback for the desktop tracking page. Prefer short
-            # meaningful headings rather than storing the complete page text.
             for tag in soup.select("h1, h2, h3, .a-size-large, .a-size-medium"):
                 text = " ".join(tag.stripped_strings)
                 if text and len(text) <= 160 and text.lower() not in {
@@ -531,7 +543,7 @@ class AmazonApiClient:
             "provider": "amazon",
             "name": desc or order_id or f"Amazon {shipment_id}",
             "status": unescape(status).strip(),
-            "tracking_id": tracking_id or None,
+            "tracking_id": tracking_id,
             "order_id": order_id or None,
             "carrier": carrier or None,
             "tracking_url": final_url,
