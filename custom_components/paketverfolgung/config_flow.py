@@ -10,7 +10,18 @@ from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .amazon_api import (
+    AmazonApiClient,
+    AmazonAuthError,
+    AmazonCaptchaError,
+    AmazonOtpChallenge,
+)
 from .const import (
+    CONF_AMAZON_COOKIES,
+    CONF_AMAZON_ENABLED,
+    CONF_AMAZON_OTP,
+    CONF_AMAZON_PASSWORD,
+    CONF_AMAZON_USERNAME,
     CONF_AUTO_DISCOVERY,
     CONF_DHL_REDIRECT,
     CONF_DHL_SESSION,
@@ -50,7 +61,6 @@ def _tracking_numbers_schema(default: list[str]) -> dict:
 
 
 def _dhl_login() -> tuple[str, str]:
-    """Return the official-app compatible PKCE verifier and browser login URL."""
     params = {
         "redirect_uri": DHL_REDIRECT_URI,
         "state": DHL_LOGIN_STATE,
@@ -70,11 +80,26 @@ def _dhl_login() -> tuple[str, str]:
 
 def _dhl_redirect_schema() -> vol.Schema:
     return vol.Schema(
+        {vol.Required(CONF_DHL_REDIRECT): selector.TextSelector(selector.TextSelectorConfig())}
+    )
+
+
+def _amazon_login_schema() -> vol.Schema:
+    return vol.Schema(
         {
-            vol.Required(CONF_DHL_REDIRECT): selector.TextSelector(
-                selector.TextSelectorConfig()
-            )
+            vol.Required(CONF_AMAZON_USERNAME): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.EMAIL)
+            ),
+            vol.Required(CONF_AMAZON_PASSWORD): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+            ),
         }
+    )
+
+
+def _amazon_otp_schema() -> vol.Schema:
+    return vol.Schema(
+        {vol.Required(CONF_AMAZON_OTP): selector.TextSelector(selector.TextSelectorConfig())}
     )
 
 
@@ -95,6 +120,7 @@ class PaketverfolgungConfigFlow(ConfigFlow, domain=DOMAIN):
             self._pending_data = {
                 CONF_TRACKING_NUMBERS: numbers,
                 CONF_AUTO_DISCOVERY: auto_discovery,
+                CONF_AMAZON_ENABLED: False,
             }
             if auto_discovery:
                 self._pkce_verifier, self._login_url = _dhl_login()
@@ -120,7 +146,6 @@ class PaketverfolgungConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "dhl_auth"
             else:
                 return await self._create_entry({**self._pending_data, CONF_DHL_SESSION: session})
-
         if not self._login_url:
             self._pkce_verifier, self._login_url = _dhl_login()
         return self.async_show_form(
@@ -142,26 +167,31 @@ class PaketverfolgungConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class PaketverfolgungOptionsFlow(OptionsFlow):
-    """Manage tracking numbers, account auto-discovery and update interval."""
+    """Manage DHL and Amazon providers plus the update interval."""
 
     def __init__(self, entry: ConfigEntry) -> None:
         self._entry = entry
         self._pending_options: dict[str, Any] = {}
         self._pkce_verifier: str | None = None
         self._login_url: str | None = None
+        self._amazon_challenge: AmazonOtpChallenge | None = None
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> Any:
         if user_input is not None:
             numbers = _clean_tracking_numbers(user_input.get(CONF_TRACKING_NUMBERS))
             auto_discovery = bool(user_input.get(CONF_AUTO_DISCOVERY, False))
+            amazon_enabled = bool(user_input.get(CONF_AMAZON_ENABLED, False))
             self._pending_options = {
                 CONF_TRACKING_NUMBERS: numbers,
                 CONF_UPDATE_INTERVAL: user_input[CONF_UPDATE_INTERVAL],
                 CONF_AUTO_DISCOVERY: auto_discovery,
+                CONF_AMAZON_ENABLED: amazon_enabled,
             }
             if auto_discovery and not self._entry.data.get(CONF_DHL_SESSION):
                 self._pkce_verifier, self._login_url = _dhl_login()
                 return await self.async_step_dhl_login()
+            if amazon_enabled and not self._entry.data.get(CONF_AMAZON_COOKIES):
+                return await self.async_step_amazon_login()
             return self.async_create_entry(title="", data=self._pending_options)
 
         current_numbers = self._entry.options.get(
@@ -173,6 +203,9 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
         current_auto = self._entry.options.get(
             CONF_AUTO_DISCOVERY, self._entry.data.get(CONF_AUTO_DISCOVERY, False)
         )
+        current_amazon = self._entry.options.get(
+            CONF_AMAZON_ENABLED, self._entry.data.get(CONF_AMAZON_ENABLED, False)
+        )
         schema = vol.Schema(
             {
                 **_tracking_numbers_schema(current_numbers),
@@ -180,6 +213,7 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
                     vol.Coerce(int), vol.Range(min=MIN_UPDATE_INTERVAL_MINUTES)
                 ),
                 vol.Optional(CONF_AUTO_DISCOVERY, default=current_auto): bool,
+                vol.Optional(CONF_AMAZON_ENABLED, default=current_amazon): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
@@ -197,8 +231,9 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
                 self.hass.config_entries.async_update_entry(
                     self._entry, data={**self._entry.data, CONF_DHL_SESSION: session}
                 )
+                if self._pending_options.get(CONF_AMAZON_ENABLED) and not self._entry.data.get(CONF_AMAZON_COOKIES):
+                    return await self.async_step_amazon_login()
                 return self.async_create_entry(title="", data=self._pending_options)
-
         if not self._login_url:
             self._pkce_verifier, self._login_url = _dhl_login()
         return self.async_show_form(
@@ -206,4 +241,67 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
             data_schema=_dhl_redirect_schema(),
             errors=errors,
             description_placeholders={"login_url": self._login_url},
+        )
+
+    async def async_step_amazon_login(self, user_input: dict[str, Any] | None = None) -> Any:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            client = AmazonApiClient()
+            try:
+                result = await client.login(
+                    user_input[CONF_AMAZON_USERNAME].strip(),
+                    user_input[CONF_AMAZON_PASSWORD],
+                )
+            except AmazonCaptchaError:
+                errors["base"] = "amazon_captcha"
+            except AmazonAuthError:
+                errors["base"] = "amazon_auth"
+            else:
+                if result.otp is not None:
+                    self._amazon_challenge = result.otp
+                    return await self.async_step_amazon_otp()
+                if result.cookies:
+                    self.hass.config_entries.async_update_entry(
+                        self._entry,
+                        data={
+                            **self._entry.data,
+                            CONF_AMAZON_COOKIES: result.cookies,
+                            CONF_AMAZON_ENABLED: True,
+                        },
+                    )
+                    return self.async_create_entry(title="", data=self._pending_options)
+            finally:
+                await client.close()
+        return self.async_show_form(
+            step_id="amazon_login", data_schema=_amazon_login_schema(), errors=errors
+        )
+
+    async def async_step_amazon_otp(self, user_input: dict[str, Any] | None = None) -> Any:
+        errors: dict[str, str] = {}
+        if self._amazon_challenge is None:
+            return await self.async_step_amazon_login()
+        if user_input is not None:
+            client = AmazonApiClient(self._amazon_challenge.cookies)
+            try:
+                cookies = await client.submit_otp(
+                    self._amazon_challenge, user_input[CONF_AMAZON_OTP].strip()
+                )
+            except AmazonCaptchaError:
+                errors["base"] = "amazon_captcha"
+            except AmazonAuthError:
+                errors["base"] = "amazon_otp"
+            else:
+                self.hass.config_entries.async_update_entry(
+                    self._entry,
+                    data={
+                        **self._entry.data,
+                        CONF_AMAZON_COOKIES: cookies,
+                        CONF_AMAZON_ENABLED: True,
+                    },
+                )
+                return self.async_create_entry(title="", data=self._pending_options)
+            finally:
+                await client.close()
+        return self.async_show_form(
+            step_id="amazon_otp", data_schema=_amazon_otp_schema(), errors=errors
         )
