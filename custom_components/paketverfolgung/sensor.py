@@ -1,10 +1,4 @@
-"""Sensor platform for Paketverfolgung (DHL).
-
-Creates one sensor entity per tracked DHL tracking number. Entities are
-added when a tracking number is configured and removed again if DHL no
-longer returns data for it (e.g. it was removed from the config, or is
-too old for DHL to still have data on it).
-"""
+"""Sensor platform for Paketverfolgung providers."""
 from __future__ import annotations
 
 from homeassistant.components.sensor import SensorEntity
@@ -14,6 +8,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    AMAZON_STATUS_ICONS,
     DEFAULT_ICON,
     DEFAULT_STATUS,
     DOMAIN,
@@ -22,42 +17,64 @@ from .const import (
     PROGRESS_STATUS,
     TRACKING_PAGE_URL,
 )
-from .coordinator import DhlDataUpdateCoordinator
+from .coordinator import AmazonDataUpdateCoordinator, DhlDataUpdateCoordinator
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    coordinator: DhlDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    known_ids: set[str] = set()
-    entities: dict[str, "DhlShipmentSensor"] = {}
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    dhl: DhlDataUpdateCoordinator = runtime["dhl"]
+    amazon: AmazonDataUpdateCoordinator | None = runtime.get("amazon")
+
+    dhl_known: set[str] = set()
+    dhl_entities: dict[str, DhlShipmentSensor] = {}
 
     @callback
-    def _sync_entities() -> None:
-        current_ids = set(coordinator.data or {})
-
-        new_ids = current_ids - known_ids
+    def _sync_dhl() -> None:
+        current_ids = set(dhl.data or {})
+        new_ids = current_ids - dhl_known
         if new_ids:
-            new_entities = [
-                DhlShipmentSensor(coordinator, entry.entry_id, shipment_id)
-                for shipment_id in new_ids
-            ]
+            new_entities = [DhlShipmentSensor(dhl, entry.entry_id, shipment_id) for shipment_id in new_ids]
             for entity in new_entities:
-                entities[entity.shipment_id] = entity
-            known_ids.update(new_ids)
+                dhl_entities[entity.shipment_id] = entity
+            dhl_known.update(new_ids)
             async_add_entities(new_entities)
-
-        removed_ids = known_ids - current_ids
-        for shipment_id in removed_ids:
-            entity = entities.pop(shipment_id, None)
-            known_ids.discard(shipment_id)
+        for shipment_id in dhl_known - current_ids:
+            entity = dhl_entities.pop(shipment_id, None)
+            dhl_known.discard(shipment_id)
             if entity is not None:
                 hass.async_create_task(entity.async_remove())
 
-    entry.async_on_unload(coordinator.async_add_listener(_sync_entities))
-    _sync_entities()
+    entry.async_on_unload(dhl.async_add_listener(_sync_dhl))
+    _sync_dhl()
+    async_add_entities([DhlOutForDeliveryTodaySensor(dhl, entry.entry_id)])
 
-    async_add_entities([DhlOutForDeliveryTodaySensor(coordinator, entry.entry_id)])
+    if amazon is not None:
+        amazon_known: set[str] = set()
+        amazon_entities: dict[str, AmazonShipmentSensor] = {}
+
+        @callback
+        def _sync_amazon() -> None:
+            current_ids = set(amazon.data or {})
+            new_ids = current_ids - amazon_known
+            if new_ids:
+                new_entities = [
+                    AmazonShipmentSensor(amazon, entry.entry_id, shipment_id)
+                    for shipment_id in new_ids
+                ]
+                for entity in new_entities:
+                    amazon_entities[entity.shipment_id] = entity
+                amazon_known.update(new_ids)
+                async_add_entities(new_entities)
+            for shipment_id in amazon_known - current_ids:
+                entity = amazon_entities.pop(shipment_id, None)
+                amazon_known.discard(shipment_id)
+                if entity is not None:
+                    hass.async_create_task(entity.async_remove())
+
+        entry.async_on_unload(amazon.async_add_listener(_sync_amazon))
+        _sync_amazon()
 
 
 class DhlShipmentSensor(CoordinatorEntity[DhlDataUpdateCoordinator], SensorEntity):
@@ -65,14 +82,10 @@ class DhlShipmentSensor(CoordinatorEntity[DhlDataUpdateCoordinator], SensorEntit
 
     _attr_has_entity_name = True
 
-    def __init__(
-        self,
-        coordinator: DhlDataUpdateCoordinator,
-        entry_id: str,
-        shipment_id: str,
-    ) -> None:
+    def __init__(self, coordinator: DhlDataUpdateCoordinator, entry_id: str, shipment_id: str) -> None:
         super().__init__(coordinator)
         self.shipment_id = shipment_id
+        # Keep the historic unique id unchanged so existing DHL entities survive the upgrade.
         self._attr_unique_id = f"{entry_id}_{shipment_id}"
 
     @property
@@ -95,13 +108,11 @@ class DhlShipmentSensor(CoordinatorEntity[DhlDataUpdateCoordinator], SensorEntit
         status = verlauf.get("kurzStatus") or verlauf.get("status")
         if status:
             return status
-        fortschritt = verlauf.get("fortschritt")
-        return PROGRESS_STATUS.get(fortschritt, DEFAULT_STATUS)
+        return PROGRESS_STATUS.get(verlauf.get("fortschritt"), DEFAULT_STATUS)
 
     @property
     def icon(self) -> str:
-        details = self._shipment.get("sendungsdetails", {})
-        fortschritt = details.get("sendungsverlauf", {}).get("fortschritt")
+        fortschritt = self._shipment.get("sendungsdetails", {}).get("sendungsverlauf", {}).get("fortschritt")
         return PROGRESS_ICONS.get(fortschritt, DEFAULT_ICON)
 
     @property
@@ -110,9 +121,6 @@ class DhlShipmentSensor(CoordinatorEntity[DhlDataUpdateCoordinator], SensorEntit
         details = self._shipment.get("sendungsdetails", {})
         verlauf = details.get("sendungsverlauf", {})
         zustellung = details.get("zustellung", {})
-        # DHL always returns the shipment's full event history, even for
-        # tracking numbers added long after the shipment was on its way -
-        # expose it so past status updates aren't lost, newest first.
         events = [
             {"datum": event.get("datum"), "status": event.get("status")}
             for event in verlauf.get("events", [])
@@ -120,6 +128,7 @@ class DhlShipmentSensor(CoordinatorEntity[DhlDataUpdateCoordinator], SensorEntit
         ]
         events.reverse()
         return {
+            "provider": "dhl",
             "tracking_id": self.shipment_id,
             "progress": verlauf.get("fortschritt"),
             "direction": info.get("sendungsrichtung"),
@@ -130,15 +139,53 @@ class DhlShipmentSensor(CoordinatorEntity[DhlDataUpdateCoordinator], SensorEntit
         }
 
 
-class DhlOutForDeliveryTodaySensor(
-    CoordinatorEntity[DhlDataUpdateCoordinator], SensorEntity
-):
-    """Counts tracked shipments DHL currently has out for delivery.
+class AmazonShipmentSensor(CoordinatorEntity[AmazonDataUpdateCoordinator], SensorEntity):
+    """Represents one Amazon delivery independently from carrier sensors."""
 
-    DHL only sets the "In Zustellung" progress step on the day the
-    courier actually has the parcel loaded onto the delivery vehicle, so
-    this doubles as "out for delivery today".
-    """
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator: AmazonDataUpdateCoordinator, entry_id: str, shipment_id: str) -> None:
+        super().__init__(coordinator)
+        self.shipment_id = shipment_id
+        self._attr_unique_id = f"{entry_id}_amazon_{shipment_id}"
+
+    @property
+    def _shipment(self) -> dict:
+        return (self.coordinator.data or {}).get(self.shipment_id, {})
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.shipment_id in (self.coordinator.data or {})
+
+    @property
+    def name(self) -> str:
+        # Stable provider-first entity name -> sensor.amazon_<id>.
+        return f"Amazon {self.shipment_id}"
+
+    @property
+    def native_value(self) -> str:
+        return self._shipment.get("status") or DEFAULT_STATUS
+
+    @property
+    def icon(self) -> str:
+        return AMAZON_STATUS_ICONS.get(self._shipment.get("short_status"), "mdi:amazon")
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        shipment = self._shipment
+        return {
+            "provider": "amazon",
+            "description": shipment.get("name"),
+            "tracking_id": shipment.get("tracking_id"),
+            "order_id": shipment.get("order_id"),
+            "carrier": shipment.get("carrier"),
+            "short_status": shipment.get("short_status"),
+            "tracking_url": shipment.get("tracking_url"),
+        }
+
+
+class DhlOutForDeliveryTodaySensor(CoordinatorEntity[DhlDataUpdateCoordinator], SensorEntity):
+    """Counts DHL shipments currently out for delivery."""
 
     _attr_has_entity_name = True
     _attr_name = "Heute in Zustellung"
@@ -154,9 +201,7 @@ class DhlOutForDeliveryTodaySensor(
         return [
             shipment
             for shipment in (self.coordinator.data or {}).values()
-            if shipment.get("sendungsdetails", {})
-            .get("sendungsverlauf", {})
-            .get("fortschritt")
+            if shipment.get("sendungsdetails", {}).get("sendungsverlauf", {}).get("fortschritt")
             == PROGRESS_OUT_FOR_DELIVERY
         ]
 
@@ -170,9 +215,7 @@ class DhlOutForDeliveryTodaySensor(
             "shipments": [
                 {
                     "tracking_id": shipment["id"],
-                    "status": shipment.get("sendungsdetails", {})
-                    .get("sendungsverlauf", {})
-                    .get("status"),
+                    "status": shipment.get("sendungsdetails", {}).get("sendungsverlauf", {}).get("status"),
                     "tracking_url": TRACKING_PAGE_URL.format(id=shipment["id"]),
                 }
                 for shipment in self._out_for_delivery
