@@ -11,40 +11,49 @@ from homeassistant.exceptions import ServiceValidationError
 
 from .const import (
     ATTR_TRACKING_NUMBER,
+    CONF_AMAZON_ENABLED,
     CONF_TRACKING_NUMBERS,
     CONF_UPDATE_INTERVAL,
     DEFAULT_UPDATE_INTERVAL_MINUTES,
     DOMAIN,
     SERVICE_ADD_TRACKING_NUMBER,
 )
-from .coordinator import DhlDataUpdateCoordinator
+from .coordinator import AmazonDataUpdateCoordinator, DhlDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
-
 PLATFORMS = ["sensor"]
-
-_ADD_TRACKING_NUMBER_SCHEMA = vol.Schema(
-    {vol.Required(ATTR_TRACKING_NUMBER): vol.Coerce(str)}
-)
+_ADD_TRACKING_NUMBER_SCHEMA = vol.Schema({vol.Required(ATTR_TRACKING_NUMBER): vol.Coerce(str)})
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up the Paketverfolgung integration."""
-    minutes = entry.options.get(
-        CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL_MINUTES
-    )
-    coordinator = DhlDataUpdateCoordinator(
-        hass, entry, update_interval=timedelta(minutes=minutes)
-    )
-    await coordinator.async_config_entry_first_refresh()
+    """Set up all enabled Paketverfolgung providers."""
+    minutes = entry.options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL_MINUTES)
+    interval = timedelta(minutes=minutes)
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    dhl = DhlDataUpdateCoordinator(hass, entry, update_interval=interval)
+    await dhl.async_config_entry_first_refresh()
+
+    amazon = None
+    amazon_enabled = entry.options.get(
+        CONF_AMAZON_ENABLED, entry.data.get(CONF_AMAZON_ENABLED, False)
+    )
+    if amazon_enabled:
+        amazon = AmazonDataUpdateCoordinator(hass, entry, update_interval=interval)
+        # Amazon failures must not prevent the already working DHL provider from loading.
+        try:
+            await amazon.async_config_entry_first_refresh()
+        except Exception:  # coordinator logs the concrete failure
+            _LOGGER.exception("Amazon provider could not complete its first refresh")
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "dhl": dhl,
+        "amazon": amazon,
+        "options_snapshot": dict(entry.options),
+    }
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
-
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     if not hass.services.has_service(DOMAIN, SERVICE_ADD_TRACKING_NUMBER):
-
         async def _async_add_tracking_number(call: ServiceCall) -> ServiceResponse:
             return await _add_tracking_number(hass, call.data[ATTR_TRACKING_NUMBER])
 
@@ -55,44 +64,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=_ADD_TRACKING_NUMBER_SCHEMA,
             supports_response=SupportsResponse.OPTIONAL,
         )
-
     return True
 
 
-async def _add_tracking_number(
-    hass: HomeAssistant, tracking_number: str
-) -> ServiceResponse:
-    """Add a tracking number to the config entry if not already tracked."""
+async def _add_tracking_number(hass: HomeAssistant, tracking_number: str) -> ServiceResponse:
+    """Add a DHL tracking number to the config entry if not already tracked."""
     entries = hass.config_entries.async_entries(DOMAIN)
     if not entries:
         raise ServiceValidationError("Paketverfolgung ist nicht eingerichtet.")
     entry = entries[0]
-
     cleaned = tracking_number.strip()
     if not cleaned:
         raise ServiceValidationError("Leere Sendungsnummer.")
 
     current = list(
-        entry.options.get(
-            CONF_TRACKING_NUMBERS, entry.data.get(CONF_TRACKING_NUMBERS, [])
-        )
+        entry.options.get(CONF_TRACKING_NUMBERS, entry.data.get(CONF_TRACKING_NUMBERS, []))
     )
     if cleaned in current:
-        _LOGGER.info("Paketverfolgung: %s wird bereits verfolgt", cleaned)
         return {"added": False, "tracking_number": cleaned}
-
     current.append(cleaned)
     hass.config_entries.async_update_entry(
         entry, options={**entry.options, CONF_TRACKING_NUMBERS: current}
     )
-    _LOGGER.info("Paketverfolgung: %s wurde hinzugefügt", cleaned)
     return {"added": True, "tracking_number": cleaned}
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload only for user-visible option changes, not OAuth token persistence."""
-    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    if coordinator is not None and dict(entry.options) == coordinator.options_snapshot:
+    """Reload only for user-visible option changes, not refreshed provider sessions."""
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime is not None and dict(entry.options) == runtime.get("options_snapshot", {}):
         return
     await hass.config_entries.async_reload(entry.entry_id)
 
