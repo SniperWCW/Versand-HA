@@ -7,6 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from yarl import URL
 
 from .amazon_api import AmazonApiClient, AmazonApiError, AmazonAuthError
 from .const import (
@@ -20,6 +21,29 @@ from .const import (
 from .dhl_api import DhlApiClient, DhlApiError, DhlAuthError
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _load_amazon_cookie_store(client: AmazonApiClient, store: dict) -> bool:
+    """Restore domain-scoped Amazon cookies. Return False for legacy stores."""
+    if store.get("_format") != "domain_v1":
+        return False
+    domains = store.get("domains") or {}
+    for domain, cookies in domains.items():
+        if not isinstance(cookies, dict) or not cookies:
+            continue
+        client._jar.update_cookies(cookies, response_url=URL(f"https://{domain}/"))
+    return True
+
+
+def _export_amazon_cookie_store(client: AmazonApiClient) -> dict:
+    """Persist the exact cookie sets sent to Amazon's two relevant hosts."""
+    domains: dict[str, dict[str, str]] = {}
+    for domain in ("amazon.de", "www.amazon.de"):
+        domains[domain] = {
+            name: morsel.value
+            for name, morsel in client._jar.filter_cookies(URL(f"https://{domain}/")).items()
+        }
+    return {"_format": "domain_v1", "domains": domains}
 
 
 class DhlDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
@@ -86,9 +110,14 @@ class AmazonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         if not cookies:
             raise UpdateFailed("Amazon is enabled but no authenticated session exists")
 
-        client = AmazonApiClient(dict(cookies))
+        client = AmazonApiClient()
+        if not _load_amazon_cookie_store(client, cookies):
+            await client.close()
+            raise UpdateFailed("Amazon session uses an old cookie format; login required")
+
         try:
-            shipments, refreshed_cookies = await client.fetch_shipments()
+            shipments, _ = await client.fetch_shipments()
+            refreshed_cookies = _export_amazon_cookie_store(client)
         except AmazonAuthError as err:
             raise UpdateFailed(f"Amazon authentication error: {err}") from err
         except AmazonApiError as err:
@@ -96,7 +125,7 @@ class AmazonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         finally:
             await client.close()
 
-        if refreshed_cookies and refreshed_cookies != cookies:
+        if refreshed_cookies != cookies:
             self.hass.config_entries.async_update_entry(
                 self.entry,
                 data={**self.entry.data, CONF_AMAZON_COOKIES: refreshed_cookies},
