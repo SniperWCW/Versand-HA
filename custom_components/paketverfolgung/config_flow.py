@@ -9,6 +9,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from yarl import URL
 
 from .amazon_api import (
     AmazonApiClient,
@@ -103,6 +104,21 @@ def _amazon_otp_schema() -> vol.Schema:
     )
 
 
+def _export_amazon_cookie_store(client: AmazonApiClient) -> dict:
+    """Store cookies separately for amazon.de and www.amazon.de."""
+    domains: dict[str, dict[str, str]] = {}
+    for domain in ("amazon.de", "www.amazon.de"):
+        domains[domain] = {
+            name: morsel.value
+            for name, morsel in client._jar.filter_cookies(URL(f"https://{domain}/")).items()
+        }
+    return {"_format": "domain_v1", "domains": domains}
+
+
+def _amazon_cookie_store_is_current(store: Any) -> bool:
+    return isinstance(store, dict) and store.get("_format") == "domain_v1"
+
+
 class PaketverfolgungConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Paketverfolgung."""
 
@@ -177,8 +193,9 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
         self._amazon_challenge: AmazonOtpChallenge | None = None
 
     def _amazon_needs_login(self) -> bool:
-        """Return True when no Amazon session exists or the last refresh rejected it."""
-        if not self._entry.data.get(CONF_AMAZON_COOKIES):
+        """Return True for missing/legacy cookies or a rejected Amazon session."""
+        store = self._entry.data.get(CONF_AMAZON_COOKIES)
+        if not _amazon_cookie_store_is_current(store):
             return True
         runtime = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id) or {}
         coordinator = runtime.get("amazon") if isinstance(runtime, dict) else None
@@ -273,7 +290,7 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
                         self._entry,
                         data={
                             **self._entry.data,
-                            CONF_AMAZON_COOKIES: result.cookies,
+                            CONF_AMAZON_COOKIES: _export_amazon_cookie_store(client),
                             CONF_AMAZON_ENABLED: True,
                         },
                     )
@@ -291,7 +308,7 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
         if user_input is not None:
             client = AmazonApiClient(self._amazon_challenge.cookies)
             try:
-                cookies = await client.submit_otp(
+                await client.submit_otp(
                     self._amazon_challenge, user_input[CONF_AMAZON_OTP].strip()
                 )
             except AmazonCaptchaError:
@@ -303,7 +320,7 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
                     self._entry,
                     data={
                         **self._entry.data,
-                        CONF_AMAZON_COOKIES: cookies,
+                        CONF_AMAZON_COOKIES: _export_amazon_cookie_store(client),
                         CONF_AMAZON_ENABLED: True,
                     },
                 )
