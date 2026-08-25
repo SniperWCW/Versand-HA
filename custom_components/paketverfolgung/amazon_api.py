@@ -1,11 +1,7 @@
-"""Amazon.de login and shipment scraping for Paketverfolgung.
-
-This provider uses Amazon's consumer web pages and therefore relies on an
-undocumented interface. Passwords are used only during the config flow and are
-not persisted; successful login cookies are stored in the config entry.
-"""
+"""Amazon.de login and shipment scraping for Paketverfolgung."""
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -31,8 +27,9 @@ AMAZON_SIGNIN_URL = (
     "&pageId=webcs-yourorder&showRmrMe=1"
 )
 AMAZON_USER_AGENT = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_7 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/139.0.0.0 Safari/537.36"
 )
 
 
@@ -72,8 +69,8 @@ class AmazonLoginResult:
 
 def _headers(referer: str | None = None) -> dict[str, str]:
     headers = {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "de-DE,de;q=0.9",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "accept-language": "de-DE,de;q=0.9,en;q=0.7",
         "cache-control": "no-cache",
         "user-agent": AMAZON_USER_AGENT,
     }
@@ -84,7 +81,6 @@ def _headers(referer: str | None = None) -> dict[str, str]:
 
 
 def _form_data(html: str) -> tuple[dict[str, str], str | None]:
-    """Extract hidden fields and the most relevant form action."""
     soup = BeautifulSoup(html, "html.parser")
     form = soup.find("form", attrs={"name": "signIn"}) or soup.find("form")
     if not form:
@@ -103,6 +99,7 @@ def _looks_authenticated(html: str, final_url: str = "") -> bool:
         "js-yo-main-content" in html
         or "order-card js-order-card" in html
         or "/gp/css/order-history" in final_url
+        or "/your-orders/" in final_url
     ) and "auth-workflow" not in html
 
 
@@ -116,14 +113,17 @@ def _looks_captcha(html: str) -> bool:
     )
 
 
-def _otp_challenge(html: str, final_url: str, cookies: dict[str, str]) -> AmazonOtpChallenge | None:
-    """Detect TOTP/SMS verification pages and return the required form."""
+def _otp_challenge(
+    html: str, final_url: str, cookies: dict[str, str]
+) -> AmazonOtpChallenge | None:
     if "auth-mfa-otpcode" in html:
         form, action = _form_data(html)
         form.pop("undefined", None)
         form.setdefault("deviceId", "")
         form["rememberDevice"] = "true"
-        return AmazonOtpChallenge(action or f"{AMAZON_BASE}/ap/signin", form, cookies, "mfa")
+        return AmazonOtpChallenge(
+            action or f"{AMAZON_BASE}/ap/signin", form, cookies, "mfa"
+        )
 
     markers = (
         "transactionapproval",
@@ -138,8 +138,45 @@ def _otp_challenge(html: str, final_url: str, cookies: dict[str, str]) -> Amazon
         form["action"] = "code"
         for key in ("resendContactType", "timerMessage", "timerComplete"):
             form.pop(key, None)
-        return AmazonOtpChallenge(action or f"{AMAZON_BASE}/ap/cvf/verify", form, cookies, "cvf")
+        return AmazonOtpChallenge(
+            action or f"{AMAZON_BASE}/ap/cvf/verify", form, cookies, "cvf"
+        )
     return None
+
+
+def _is_tracking_href(href: str) -> bool:
+    """Return True for known Amazon package-tracking URLs."""
+    lowered = href.lower()
+    markers = (
+        "progress-tracker",
+        "track-package",
+        "trackpackage",
+        "ship-track",
+        "shipment-tracking",
+        "tracking/package",
+        "package-tracking",
+    )
+    if any(marker in lowered for marker in markers):
+        return True
+    # Amazon also uses generic your-orders endpoints whose query contains shipment IDs.
+    return (
+        "your-orders" in lowered
+        and ("shipmentid=" in lowered or "packageid=" in lowered)
+    )
+
+
+def _query_value(url: str, *keys: str) -> str:
+    parsed = parse_qs(urlparse(url).query)
+    for key in keys:
+        value = parsed.get(key)
+        if value:
+            return value[0]
+    lowered = {key.lower(): value for key, value in parsed.items()}
+    for key in keys:
+        value = lowered.get(key.lower())
+        if value:
+            return value[0]
+    return ""
 
 
 class AmazonApiClient:
@@ -178,9 +215,17 @@ class AmazonApiClient:
             if not form:
                 raise AmazonAuthError("Amazon login form not found")
 
-            # Current Amazon login may use a Unified Claim Collection / email-only page.
-            has_password = BeautifulSoup(html, "html.parser").find("input", {"type": "password"}) is not None
-            if form.get("appAction") == "SIGNIN_CLAIM_COLLECT" or "FullPageUnifiedClaimCollect" in html or not has_password:
+            has_password = (
+                BeautifulSoup(html, "html.parser").find(
+                    "input", {"type": "password"}
+                )
+                is not None
+            )
+            if (
+                form.get("appAction") == "SIGNIN_CLAIM_COLLECT"
+                or "FullPageUnifiedClaimCollect" in html
+                or not has_password
+            ):
                 for key in (
                     "webAuthnGetArbForAutofill",
                     "webAuthnGetParametersForAutofill",
@@ -226,14 +271,18 @@ class AmazonApiClient:
             challenge = _otp_challenge(html, final_url, cookies)
             if challenge:
                 return AmazonLoginResult(otp=challenge)
-            raise AmazonAuthError("Amazon rejected the login or returned an unsupported verification page")
+            raise AmazonAuthError(
+                "Amazon rejected the login or returned an unsupported verification page"
+            )
         except ClientError as err:
             raise AmazonAuthError(f"Network error during Amazon login: {err}") from err
 
-    async def submit_otp(self, challenge: AmazonOtpChallenge, code: str) -> dict[str, str]:
-        """Submit a pending Amazon MFA/SMS code and return authenticated cookies."""
-        # Rehydrate cookies captured before the verification step.
-        self._jar.update_cookies(challenge.cookies, response_url=URL(AMAZON_BASE))
+    async def submit_otp(
+        self, challenge: AmazonOtpChallenge, code: str
+    ) -> dict[str, str]:
+        self._jar.update_cookies(
+            challenge.cookies, response_url=URL(AMAZON_BASE)
+        )
         form = dict(challenge.form)
         if challenge.mode == "mfa":
             form["otpCode"] = code
@@ -256,9 +305,13 @@ class AmazonApiClient:
                 raise AmazonAuthError("Amazon verification code was not accepted")
             return self.export_cookies()
         except ClientError as err:
-            raise AmazonAuthError(f"Network error during Amazon verification: {err}") from err
+            raise AmazonAuthError(
+                f"Network error during Amazon verification: {err}"
+            ) from err
 
-    async def fetch_shipments(self) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    async def fetch_shipments(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         """Return currently trackable Amazon deliveries plus refreshed cookies."""
         try:
             async with self._session.get(
@@ -270,55 +323,117 @@ class AmazonApiClient:
                 raise AmazonAuthError("Amazon session expired")
 
             soup = BeautifulSoup(html, "html.parser")
+            order_cards = soup.select(
+                ".order-card.js-order-card, .order-card, [data-order-id], .js-order-card"
+            )
             order_links: list[tuple[str, str]] = []
-            for order in soup.select(".order-card.js-order-card"):
-                desc_tag = order.select_one(
-                    ".a-fixed-right-grid-col.a-col-left .a-fixed-left-grid-col.a-col-right div:first-child .a-link-normal"
+            seen_urls: set[str] = set()
+
+            # First prefer links attached to individual order cards so we can keep a
+            # useful product/order description where available.
+            for order in order_cards:
+                desc_tag = (
+                    order.select_one(".yohtmlc-product-title")
+                    or order.select_one(".a-link-normal[href*='/dp/']")
+                    or order.select_one(".a-fixed-right-grid-col .a-link-normal")
                 )
                 desc = " ".join(desc_tag.stripped_strings) if desc_tag else ""
-                link = order.select_one(".track-package-button a")
-                if not link:
-                    link = next(
-                        (
-                            candidate
-                            for candidate in order.select(".a-button-inner a")
-                            if "Lieferung verfolgen" in candidate.get_text(" ", strip=True)
-                        ),
-                        None,
-                    )
-                if not link:
-                    link = order.select_one(".yohtmlc-shipment-level-connections .a-button-inner a")
-                href = link.get("href") if link else None
-                if href:
-                    order_links.append((desc, urljoin(AMAZON_BASE, href)))
+                for link in order.select("a[href]"):
+                    href = str(link.get("href") or "")
+                    text = link.get_text(" ", strip=True).lower()
+                    if not (
+                        _is_tracking_href(href)
+                        or "lieferung verfolgen" in text
+                        or "sendung verfolgen" in text
+                        or "paket verfolgen" in text
+                    ):
+                        continue
+                    absolute = urljoin(AMAZON_BASE, href)
+                    if absolute not in seen_urls:
+                        seen_urls.add(absolute)
+                        order_links.append((desc, absolute))
+
+            # Fallback: Amazon regularly changes the order-card markup. Scan the
+            # complete page so a changed wrapper class doesn't hide tracking links.
+            for link in soup.select("a[href]"):
+                href = str(link.get("href") or "")
+                text = link.get_text(" ", strip=True).lower()
+                if not (
+                    _is_tracking_href(href)
+                    or "lieferung verfolgen" in text
+                    or "sendung verfolgen" in text
+                    or "paket verfolgen" in text
+                ):
+                    continue
+                absolute = urljoin(AMAZON_BASE, href)
+                if absolute not in seen_urls:
+                    seen_urls.add(absolute)
+                    order_links.append(("", absolute))
+
+            if not order_links:
+                _LOGGER.warning(
+                    "Amazon: order page loaded but no tracking links were found "
+                    "(order_cards=%d, page_links=%d)",
+                    len(order_cards),
+                    len(soup.select("a[href]")),
+                )
 
             shipments: list[dict[str, Any]] = []
             for desc, url in order_links:
                 shipment = await self._fetch_tracking_page(url, desc)
                 if shipment:
                     shipments.append(shipment)
+
+            _LOGGER.info(
+                "Amazon: order_cards=%d tracking_links=%d shipments=%d",
+                len(order_cards),
+                len(order_links),
+                len(shipments),
+            )
             return shipments, self.export_cookies()
         except ClientError as err:
-            raise AmazonApiError(f"Network error fetching Amazon orders: {err}") from err
+            raise AmazonApiError(
+                f"Network error fetching Amazon orders: {err}"
+            ) from err
 
-    async def _fetch_tracking_page(self, url: str, desc: str) -> dict[str, Any] | None:
-        async with self._session.get(url, headers=_headers(AMAZON_ORDERS_URL), timeout=25) as response:
-            html = await response.text()
+    async def _fetch_tracking_page(
+        self, url: str, desc: str
+    ) -> dict[str, Any] | None:
+        try:
+            async with self._session.get(
+                url, headers=_headers(AMAZON_ORDERS_URL), timeout=25
+            ) as response:
+                html = await response.text()
+                final_url = str(response.url)
+        except ClientError as err:
+            raise AmazonApiError(
+                f"Network error fetching Amazon tracking page: {err}"
+            ) from err
+
+        if "auth-workflow" in html or "/ap/signin" in final_url:
+            raise AmazonAuthError("Amazon session expired while opening tracking page")
+
         soup = BeautifulSoup(html, "html.parser")
+        page_text = " ".join(soup.stripped_strings)
 
         state: dict[str, Any] = {}
-        state_script = soup.select_one('script[data-a-state*="page-state"]')
-        if state_script and state_script.string:
-            import json
+        for state_script in soup.select('script[data-a-state*="page-state"]'):
+            if not state_script.string:
+                continue
             try:
-                state = json.loads(state_script.string)
+                candidate = json.loads(state_script.string)
             except (ValueError, TypeError):
-                state = {}
+                continue
+            if isinstance(candidate, dict):
+                state = candidate
+                break
 
         status_tag = (
             soup.select_one(".pt-status-main-status")
             or soup.select_one(".milestone-primaryMessage.alpha")
             or soup.select_one(".milestone-primaryMessage")
+            or soup.select_one("#primaryStatus")
+            or soup.select_one("h1")
         )
         status = " ".join(status_tag.stripped_strings) if status_tag else ""
         promise = state.get("promise") or {}
@@ -346,22 +461,70 @@ class AmazonApiClient:
             additions.append(callout)
         if additions:
             status = ". ".join([part for part in [status, *additions] if part])
-        if not status:
-            return None
 
-        tracking_tag = soup.select_one(".pt-delivery-card-trackingId")
+        tracking_tag = (
+            soup.select_one(".pt-delivery-card-trackingId")
+            or soup.select_one("[class*='trackingId']")
+            or soup.select_one("[class*='tracking-id']")
+        )
         tracking_id = " ".join(tracking_tag.stripped_strings) if tracking_tag else ""
-        tracking_id = re.sub(r"^Trackingnummer\s*", "", tracking_id, flags=re.I).strip()
-        order_id = parse_qs(urlparse(url).query).get("orderId", [""])[0]
-        shipment_id = tracking_id or order_id
+        tracking_id = re.sub(
+            r"^Trackingnummer\s*:?\s*", "", tracking_id, flags=re.I
+        ).strip()
+        if not tracking_id:
+            match = re.search(
+                r"Trackingnummer\s*:?\s*([A-Z0-9][A-Z0-9-]{5,})",
+                page_text,
+                flags=re.I,
+            )
+            if match:
+                tracking_id = match.group(1)
+
+        order_id = _query_value(final_url, "orderId", "orderID", "order")
+        shipment_query_id = _query_value(
+            final_url, "shipmentId", "shipmentID", "packageId", "packageID"
+        )
+        shipment_id = tracking_id or shipment_query_id or order_id
         if not shipment_id:
+            _LOGGER.warning("Amazon: tracking page found but no shipment identifier")
             return None
 
-        carrier_tag = soup.select_one(".carrierRelatedInfo-mfn-providerTitle")
+        carrier_tag = (
+            soup.select_one(".carrierRelatedInfo-mfn-providerTitle")
+            or soup.select_one("[class*='providerTitle']")
+        )
         carrier = " ".join(carrier_tag.stripped_strings) if carrier_tag else ""
-        short_status = ((state.get("detailedState") or {}).get("shortStatus") or state.get("shortStatus"))
-        if not short_status:
-            short_status = (state.get("progressTracker") or {}).get("shortStatus")
+        if not carrier:
+            carrier_match = re.search(
+                r"Versendet mit\s+([^|]+?)(?:\s+Versandadresse|\s+Bestellinfo|$)",
+                page_text,
+                flags=re.I,
+            )
+            if carrier_match:
+                carrier = carrier_match.group(1).strip()
+
+        short_status = (
+            (state.get("detailedState") or {}).get("shortStatus")
+            or state.get("shortStatus")
+            or (state.get("progressTracker") or {}).get("shortStatus")
+        )
+
+        if not status:
+            # Last-resort fallback for the desktop tracking page. Prefer short
+            # meaningful headings rather than storing the complete page text.
+            for tag in soup.select("h1, h2, h3, .a-size-large, .a-size-medium"):
+                text = " ".join(tag.stripped_strings)
+                if text and len(text) <= 160 and text.lower() not in {
+                    "versandadresse",
+                    "bestellinfo",
+                }:
+                    status = text
+                    break
+        if not status:
+            _LOGGER.warning(
+                "Amazon: shipment identifier found but no status could be parsed"
+            )
+            return None
 
         return {
             "id": shipment_id,
@@ -371,6 +534,6 @@ class AmazonApiClient:
             "tracking_id": tracking_id or None,
             "order_id": order_id or None,
             "carrier": carrier or None,
-            "tracking_url": url,
+            "tracking_url": final_url,
             "short_status": short_status,
         }
