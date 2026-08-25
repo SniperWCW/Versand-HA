@@ -176,6 +176,14 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
         self._login_url: str | None = None
         self._amazon_challenge: AmazonOtpChallenge | None = None
 
+    def _amazon_needs_login(self) -> bool:
+        """Return True when no Amazon session exists or the last refresh rejected it."""
+        if not self._entry.data.get(CONF_AMAZON_COOKIES):
+            return True
+        runtime = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id) or {}
+        coordinator = runtime.get("amazon") if isinstance(runtime, dict) else None
+        return coordinator is not None and not coordinator.last_update_success
+
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> Any:
         if user_input is not None:
             numbers = _clean_tracking_numbers(user_input.get(CONF_TRACKING_NUMBERS))
@@ -190,7 +198,7 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
             if auto_discovery and not self._entry.data.get(CONF_DHL_SESSION):
                 self._pkce_verifier, self._login_url = _dhl_login()
                 return await self.async_step_dhl_login()
-            if amazon_enabled and not self._entry.data.get(CONF_AMAZON_COOKIES):
+            if amazon_enabled and self._amazon_needs_login():
                 return await self.async_step_amazon_login()
             return self.async_create_entry(title="", data=self._pending_options)
 
@@ -231,7 +239,7 @@ class PaketverfolgungOptionsFlow(OptionsFlow):
                 self.hass.config_entries.async_update_entry(
                     self._entry, data={**self._entry.data, CONF_DHL_SESSION: session}
                 )
-                if self._pending_options.get(CONF_AMAZON_ENABLED) and not self._entry.data.get(CONF_AMAZON_COOKIES):
+                if self._pending_options.get(CONF_AMAZON_ENABLED) and self._amazon_needs_login():
                     return await self.async_step_amazon_login()
                 return self.async_create_entry(title="", data=self._pending_options)
         if not self._login_url:
