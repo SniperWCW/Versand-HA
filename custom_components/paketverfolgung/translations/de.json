@@ -11,7 +11,7 @@
       },
       "dhl_login": {
         "title": "Mit DHL verbinden",
-        "description": "1. Öffne [DHL Login]({login_url}) und melde dich an. 2. Nach erfolgreichem Login versucht der Browser eine `dhllogin://...` Adresse zu öffnen. Kopiere diese vollständige Adresse und füge sie unten ein.",
+        "description": "Öffne [DHL Login]({login_url}), melde dich mit geöffneten Browser-Entwicklerwerkzeugen an und kopiere anschließend im Netzwerk-Tab aus dem Eintrag `login?code` die vollständige `dhllogin://...` Request URL.",
         "data": {
           "dhl_redirect": "dhllogin:// Weiterleitungsadresse"
         }
@@ -27,23 +27,42 @@
   "options": {
     "step": {
       "init": {
-        "description": "Sendungsnummern, automatische DHL-Kontoerkennung und Aktualisierungsintervall anpassen.",
+        "description": "Provider und Aktualisierungsintervall anpassen. Amazon erzeugt eigene `sensor.amazon_*`-Entitäten.",
         "data": {
-          "tracking_numbers": "Sendungsnummern",
+          "tracking_numbers": "DHL-Sendungsnummern",
           "update_interval_minutes": "Aktualisierungsintervall (Minuten)",
-          "auto_discovery": "Sendungen automatisch aus meinem DHL-Konto erkennen"
+          "auto_discovery": "Sendungen automatisch aus meinem DHL-Konto erkennen",
+          "amazon_enabled": "Amazon-Lieferungen automatisch erkennen"
         }
       },
       "dhl_login": {
         "title": "Mit DHL verbinden",
-        "description": "1. Öffne [DHL Login]({login_url}) und melde dich an. 2. Kopiere anschließend die vollständige `dhllogin://...` Weiterleitungsadresse und füge sie unten ein.",
+        "description": "Öffne [DHL Login]({login_url}), melde dich an und kopiere im Netzwerk-Tab der Entwicklerwerkzeuge aus `login?code` die vollständige `dhllogin://...` Request URL.",
         "data": {
           "dhl_redirect": "dhllogin:// Weiterleitungsadresse"
+        }
+      },
+      "amazon_login": {
+        "title": "Mit Amazon.de verbinden",
+        "description": "Melde dich mit deinem Amazon.de-Konto an. Das Passwort wird nur für diesen Login-Versuch verwendet und nicht gespeichert. Home Assistant speichert anschließend ausschließlich die Amazon-Session-Cookies.",
+        "data": {
+          "amazon_username": "Amazon E-Mail-Adresse oder Mobilnummer",
+          "amazon_password": "Amazon Passwort"
+        }
+      },
+      "amazon_otp": {
+        "title": "Amazon-Bestätigungscode",
+        "description": "Amazon verlangt eine zusätzliche Bestätigung. Gib den Einmalcode aus deiner Authenticator-App, SMS oder Amazon-Bestätigung ein.",
+        "data": {
+          "amazon_otp": "Bestätigungscode"
         }
       }
     },
     "error": {
-      "dhl_auth": "DHL-Anmeldung fehlgeschlagen. Erzeuge bitte über den Link einen neuen Login-Code und versuche es erneut."
+      "dhl_auth": "DHL-Anmeldung fehlgeschlagen. Erzeuge bitte über den Link einen neuen Login-Code und versuche es erneut.",
+      "amazon_auth": "Amazon-Anmeldung fehlgeschlagen. Prüfe die Zugangsdaten oder melde dich einmal direkt bei Amazon.de im Browser an und versuche es erneut.",
+      "amazon_captcha": "Amazon verlangt derzeit ein Captcha oder eine manuelle Sicherheitsprüfung. Melde dich einmal direkt bei Amazon.de im Browser an und versuche die Einrichtung danach erneut.",
+      "amazon_otp": "Der Amazon-Bestätigungscode wurde nicht akzeptiert. Bitte einen neuen Code verwenden."
     }
   },
   "services": {
