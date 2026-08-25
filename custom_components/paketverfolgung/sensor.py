@@ -4,6 +4,7 @@ from __future__ import annotations
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -53,6 +54,8 @@ async def async_setup_entry(
     if amazon is not None:
         amazon_known: set[str] = set()
         amazon_entities: dict[str, AmazonShipmentSensor] = {}
+        registry = er.async_get(hass)
+        amazon_unique_prefix = f"{entry.entry_id}_amazon_"
 
         @callback
         def _sync_amazon() -> None:
@@ -72,6 +75,20 @@ async def async_setup_entry(
                 amazon_known.discard(shipment_id)
                 if entity is not None:
                     hass.async_create_task(entity.async_remove())
+
+            # After a successful Amazon refresh, remove registry entries from older
+            # parser versions that are no longer returned (e.g. internal shipmentId
+            # placeholders without a real tracking number).
+            if amazon.last_update_success:
+                for registry_entry in er.async_entries_for_config_entry(
+                    registry, entry.entry_id
+                ):
+                    unique_id = registry_entry.unique_id
+                    if not unique_id.startswith(amazon_unique_prefix):
+                        continue
+                    shipment_id = unique_id[len(amazon_unique_prefix):]
+                    if shipment_id not in current_ids:
+                        registry.async_remove(registry_entry.entity_id)
 
         entry.async_on_unload(amazon.async_add_listener(_sync_amazon))
         _sync_amazon()
@@ -159,7 +176,6 @@ class AmazonShipmentSensor(CoordinatorEntity[AmazonDataUpdateCoordinator], Senso
 
     @property
     def name(self) -> str:
-        # Stable provider-first entity name -> sensor.amazon_<id>.
         return f"Amazon {self.shipment_id}"
 
     @property
